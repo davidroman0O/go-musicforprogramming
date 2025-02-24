@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"sync"
 
 	"github.com/bogem/id3v2"
@@ -18,13 +17,12 @@ import (
 
 // Episode represents a podcast episode with a reformatted title.
 type Episode struct {
-	Number       string
-	Title        string
-	URL          string
-	ExpectedSize int64
+	Number string
+	Title  string
+	URL    string
 }
 
-// Downloader manages downloading and tagging episodes.
+// Downloader manages the downloading and tagging process.
 type Downloader struct {
 	OutputDir string
 	FeedURL   string
@@ -98,7 +96,6 @@ func (d *Downloader) fetchCover() error {
 
 // loadEpisodes parses the RSS feed and creates a list of episodes,
 // reformatting titles from "Episode XX: Title" to "XX - Title".
-// It also extracts the expected file size from the enclosure.
 func (d *Downloader) loadEpisodes() error {
 	parser := gofeed.NewParser()
 	feed, err := parser.ParseURL(d.FeedURL)
@@ -116,18 +113,10 @@ func (d *Downloader) loadEpisodes() error {
 			log.Printf("Unrecognized title format, skipping: %s", item.Title)
 			continue
 		}
-		// Parse expected size from enclosure.
-		var expSize int64 = 0
-		if sizeStr := item.Enclosures[0].Length; sizeStr != "" {
-			if size, err := strconv.ParseInt(sizeStr, 10, 64); err == nil {
-				expSize = size
-			}
-		}
 		ep := Episode{
-			Number:       matches[1],
-			Title:        matches[2],
-			URL:          item.Enclosures[0].URL,
-			ExpectedSize: expSize,
+			Number: matches[1],
+			Title:  matches[2],
+			URL:    item.Enclosures[0].URL,
 		}
 		d.Episodes = append(d.Episodes, ep)
 	}
@@ -141,9 +130,12 @@ func (d *Downloader) loadEpisodes() error {
 }
 
 // downloadAndTagEpisodes processes episodes concurrently.
+// If a file already exists, it checks its metadata. If metadata is incomplete,
+// it updates the metadata without re-downloading.
 func (d *Downloader) downloadAndTagEpisodes() {
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, 3) // Limit concurrent downloads to 3.
+	sem := make(chan struct{}, 3) // Limit concurrent processing to 3.
+	coverPath := filepath.Join(d.OutputDir, "cover.jpg")
 
 	for _, ep := range d.Episodes {
 		wg.Add(1)
@@ -156,17 +148,34 @@ func (d *Downloader) downloadAndTagEpisodes() {
 			fileName := fmt.Sprintf("%s - %s.mp3", ep.Number, ep.Title)
 			targetPath := filepath.Join(d.OutputDir, fileName)
 
-			if fileIsComplete(ep.URL, targetPath, ep.ExpectedSize) {
-				log.Printf("Episode '%s' is already complete.", fileName)
+			// Check if the file exists.
+			if _, err := os.Stat(targetPath); err == nil {
+				// File exists, so check if its metadata is complete.
+				metaOk, err := metadataComplete(targetPath)
+				if err != nil {
+					log.Printf("Error reading metadata for '%s': %v", fileName, err)
+				}
+				if metaOk {
+					log.Printf("Episode '%s' is already complete.", fileName)
+					return
+				}
+				// Update metadata if incomplete.
+				log.Printf("File '%s' exists but metadata is incomplete. Updating metadata...", fileName)
+				if err := tagEpisode(targetPath, coverPath); err != nil {
+					log.Printf("Error updating metadata for '%s': %v", fileName, err)
+				} else {
+					log.Printf("Metadata updated for '%s'.", fileName)
+				}
 				return
 			}
 
+			// File doesn't exist; download and tag.
 			log.Printf("Downloading episode '%s'...", fileName)
 			if err := downloadFile(ep.URL, targetPath); err != nil {
 				log.Printf("Error downloading '%s': %v", fileName, err)
 				return
 			}
-			if err := tagEpisode(targetPath, filepath.Join(d.OutputDir, "cover.jpg")); err != nil {
+			if err := tagEpisode(targetPath, coverPath); err != nil {
 				log.Printf("Error tagging '%s': %v", fileName, err)
 				return
 			}
@@ -194,41 +203,7 @@ func downloadFile(url, dest string) error {
 	return err
 }
 
-// fileIsComplete checks if a file exists, has the expected size, and contains valid metadata.
-func fileIsComplete(url, path string, expectedSize int64) bool {
-	// seems buggy for now, i don't have the time, fuck that
-	{
-		// info, err := os.Stat(path)
-		// if err != nil {
-		// 	return false
-		// }
-		// Use expected size if available.
-		// if expectedSize > 0 {
-		// 	fmt.Printf("Sizes %d %d\n", info.Size(), expectedSize)
-		// 	if info.Size() != expectedSize {
-		// 		return false
-		// 	}
-		// } else {
-		// Fallback: use HEAD request to check size.
-		// resp, err := http.Head(url)
-		// if err != nil {
-		// 	return false
-		// }
-		// defer resp.Body.Close()
-		// if resp.ContentLength > 0 && info.Size() != resp.ContentLength {
-		// 	return false
-		// }
-		// }
-	}
-	// Check metadata completeness.
-	metaOk, err := metadataComplete(path)
-	if err != nil || !metaOk {
-		return false
-	}
-	return true
-}
-
-// metadataComplete verifies that the MP3 file contains the expected album metadata and attached cover.
+// metadataComplete checks that the MP3 file has the expected album metadata and attached cover.
 func metadataComplete(mp3Path string) (bool, error) {
 	tag, err := id3v2.Open(mp3Path, id3v2.Options{Parse: true})
 	if err != nil {
@@ -239,7 +214,6 @@ func metadataComplete(mp3Path string) (bool, error) {
 	if tag.Album() != "Music For Programming" {
 		return false, nil
 	}
-
 	frames := tag.GetFrames("APIC")
 	if len(frames) == 0 {
 		return false, nil
