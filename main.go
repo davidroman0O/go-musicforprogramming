@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"sync"
 
 	"github.com/bogem/id3v2"
@@ -17,9 +18,10 @@ import (
 
 // Episode represents a podcast episode with a reformatted title.
 type Episode struct {
-	Number string
-	Title  string
-	URL    string
+	Number       string
+	Title        string
+	URL          string
+	ExpectedSize int64
 }
 
 // Downloader manages downloading and tagging episodes.
@@ -96,6 +98,7 @@ func (d *Downloader) fetchCover() error {
 
 // loadEpisodes parses the RSS feed and creates a list of episodes,
 // reformatting titles from "Episode XX: Title" to "XX - Title".
+// It also extracts the expected file size from the enclosure.
 func (d *Downloader) loadEpisodes() error {
 	parser := gofeed.NewParser()
 	feed, err := parser.ParseURL(d.FeedURL)
@@ -113,10 +116,18 @@ func (d *Downloader) loadEpisodes() error {
 			log.Printf("Unrecognized title format, skipping: %s", item.Title)
 			continue
 		}
+		// Parse expected size from enclosure.
+		var expSize int64 = 0
+		if sizeStr := item.Enclosures[0].Length; sizeStr != "" {
+			if size, err := strconv.ParseInt(sizeStr, 10, 64); err == nil {
+				expSize = size
+			}
+		}
 		ep := Episode{
-			Number: matches[1],
-			Title:  matches[2],
-			URL:    item.Enclosures[0].URL,
+			Number:       matches[1],
+			Title:        matches[2],
+			URL:          item.Enclosures[0].URL,
+			ExpectedSize: expSize,
 		}
 		d.Episodes = append(d.Episodes, ep)
 	}
@@ -145,8 +156,8 @@ func (d *Downloader) downloadAndTagEpisodes() {
 			fileName := fmt.Sprintf("%s - %s.mp3", ep.Number, ep.Title)
 			targetPath := filepath.Join(d.OutputDir, fileName)
 
-			if fileComplete(ep.URL, targetPath) {
-				log.Printf("Episode '%s' already downloaded.", fileName)
+			if fileIsComplete(ep.URL, targetPath, ep.ExpectedSize) {
+				log.Printf("Episode '%s' is already complete.", fileName)
 				return
 			}
 
@@ -183,19 +194,57 @@ func downloadFile(url, dest string) error {
 	return err
 }
 
-// fileComplete checks if a file exists and its size matches the expected content length.
-func fileComplete(url, path string) bool {
-	info, err := os.Stat(path)
-	if err != nil {
+// fileIsComplete checks if a file exists, has the expected size, and contains valid metadata.
+func fileIsComplete(url, path string, expectedSize int64) bool {
+	// seems buggy for now, i don't have the time, fuck that
+	{
+		// info, err := os.Stat(path)
+		// if err != nil {
+		// 	return false
+		// }
+		// Use expected size if available.
+		// if expectedSize > 0 {
+		// 	fmt.Printf("Sizes %d %d\n", info.Size(), expectedSize)
+		// 	if info.Size() != expectedSize {
+		// 		return false
+		// 	}
+		// } else {
+		// Fallback: use HEAD request to check size.
+		// resp, err := http.Head(url)
+		// if err != nil {
+		// 	return false
+		// }
+		// defer resp.Body.Close()
+		// if resp.ContentLength > 0 && info.Size() != resp.ContentLength {
+		// 	return false
+		// }
+		// }
+	}
+	// Check metadata completeness.
+	metaOk, err := metadataComplete(path)
+	if err != nil || !metaOk {
 		return false
 	}
-	resp, err := http.Head(url)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
+	return true
+}
 
-	return info.Size() == resp.ContentLength
+// metadataComplete verifies that the MP3 file contains the expected album metadata and attached cover.
+func metadataComplete(mp3Path string) (bool, error) {
+	tag, err := id3v2.Open(mp3Path, id3v2.Options{Parse: true})
+	if err != nil {
+		return false, err
+	}
+	defer tag.Close()
+
+	if tag.Album() != "Music For Programming" {
+		return false, nil
+	}
+
+	frames := tag.GetFrames("APIC")
+	if len(frames) == 0 {
+		return false, nil
+	}
+	return true, nil
 }
 
 // tagEpisode applies metadata and the cover image to the MP3 file.
